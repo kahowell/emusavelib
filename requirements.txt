@@ -1,0 +1,2 @@
+llfuse==0.40
+python-daemon==1.6
