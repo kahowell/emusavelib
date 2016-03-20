@@ -3,13 +3,15 @@
 Developed using information from http://www.psdevwiki.com/ps3/Game_Saves
 """
 
-from ctypes import Structure, Union, sizeof, c_ubyte, c_char
+from ctypes import Structure, LittleEndianStructure, Union
+from ctypes import sizeof, memset, addressof, memmove
+from ctypes import c_ubyte, c_char, c_ushort, c_int32
 import logging
 
 log = logging.getLogger(__name__)
 
 
-class DirectoryFrame(Structure):
+class DirectoryFrame(LittleEndianStructure):
     """Frame that contains bookkeeping data for save blocks."""
 
     BLOCK_AVAILABLE = 0xA0
@@ -29,7 +31,7 @@ class DirectoryFrame(Structure):
     _fields_ = [
         ('block_state', c_ubyte),
         ('reserved', c_ubyte * 3),
-        ('use', c_ubyte * 4),
+        ('save_length', c_int32),
         ('next_block', c_ubyte),
         ('next_frame', c_ubyte),
         ('country_code', c_char * 2),
@@ -46,6 +48,8 @@ class DirectoryFrame(Structure):
         """
         if data:
             return cls.from_buffer_copy(data)
+        else:
+            return super(DirectoryFrame, cls).__new__(cls)
 
     def __init__(self, data=None):
         """Initialize a new DirectoryFrame.
@@ -107,6 +111,8 @@ class HeaderBlock(Structure):
         if data:
             assert self.magic == b'MC'
             return cls.from_buffer_copy(data)
+        else:
+            return super(HeaderBlock, cls).__new__(cls)
 
     def __init__(self, data=None):
         """Initialize a new header block.
@@ -117,17 +123,18 @@ class HeaderBlock(Structure):
         if data is None:
             self.magic = b'MC'
             self.xor = 0xe
-            memset(self._filler, 0xff, sizeof(self._filler))
+            memset(addressof(self._filler), 0xff, sizeof(self._filler))
             for frame in self.directory_frames:
                 frame.block_state = DirectoryFrame.BLOCK_AVAILABLE
                 frame.fix_xor()
             for frame in self.unused_frames:
                 frame.block_state = DirectoryFrame.BLOCK_UNUSABLE
-                memset(frame.reserved, 0xff, sizeof(frame.reserved))
-                memset(frame.link_order, 0xff, sizeof(frame.link_order))
+                memset(addressof(frame.reserved), 0xff, sizeof(frame.reserved))
+                frame.next_frame = 0xFF
+                frame.next_block = 0xFF
 
 
-class MetadataBlock(Structure):
+class MetadataBlock(LittleEndianStructure):
     """Block that holds save metadata and some of the actual save data.
 
     Icon data and save data is intermingled in the `data` field, and it is up
@@ -144,7 +151,7 @@ class MetadataBlock(Structure):
         ('pocketstation_identifier', c_char * 4),
         ('pocketstation_ap_icon_frame_count', c_ubyte * 2),
         ('_padding1', c_ubyte * 8),
-        ('color_pallete', c_ubyte * 32),
+        ('color_palette', c_ushort * 16),
         ('data', c_ubyte * (128 * 63)),
     ]
 
@@ -155,6 +162,8 @@ class MetadataBlock(Structure):
         """
         if data:
             return cls.from_buffer_copy(data)
+        else:
+            return super(MetadataBlock, cls).__new__(cls)
 
     def __init__(self, data=None):
         """Initialize a new metadata block."""
@@ -200,6 +209,22 @@ class Save(object):
         """Extract the block count from save metadata."""
         return self.metadata.save_block_count
 
+    def is_valid(self):
+        """Validate some basic things about a save."""
+        magic_bytes = self.metadata.magic
+        length = len(buffer(self.data))
+        if magic_bytes != b'SC':
+            log.info('Wrong magic bytes: {}'.format(magic_bytes))
+            return False
+        if length % 8192 != 0:
+            log.info('Odd size of data; not a multiple of 8192')
+            return False
+        blocks_based_on_length = int(length / 8192)
+        if blocks_based_on_length != self.blocks:
+            log.info('Block count wrong in metadata')
+            return False
+        return True
+
     def __repr__(self):
         return '<Save: filename="{filename}" blocks={blocks}>'.format(
             filename=self.filename,
@@ -232,27 +257,58 @@ class MemoryCard(Structure):
         if data:
             offset = cls._detect_offset(data)
             return cls.from_buffer_copy(bytes(data)[offset:])
+        else:
+            return super(MemoryCard, cls).__new__(cls)
 
     def __init__(self, data):
         if data is None:
             self.header = HeaderBlock()
+
+    def _gather_save(self, first_block_index):
+        index = first_block_index
+        directory_frames = []
+        data_blocks = []
+        data = bytearray()
+        while index != 0xff:
+            directory_frame = self.header.directory_frames[index]
+            directory_frames.append(directory_frame)
+            data_blocks.append(self.data[index])
+            if index == directory_frame.next_block:
+                sys.exit(1)
+            index = directory_frame.next_block
+        return directory_frames, data_blocks
 
     def get_save_at_index(self, first_block_index):
         """Extract a `Save` from the data block at the given index.
 
         Valid indexes are 0-14
         """
-        index = first_block_index
-        directory_frames = []
         data = bytearray()
-        while index != 0xff:
-            directory_frame = self.header.directory_frames[index]
-            directory_frames.append(directory_frame)
-            data_block = self.data[index]
+        directory_frames, data_blocks = self._gather_save(first_block_index)
+        for data_block in data_blocks:
             data += bytearray(data_block.raw)
-            index = directory_frame.next_block
         filename = directory_frames[0].filename
         return Save(filename=filename, data=data)
+
+    def delete_save(self, target):
+        # find index by filename
+        index = None
+        for i, save in self.get_slot_saves().items():
+            if save.filename == target.filename:
+                index = i
+        self.delete_save_at_index(index)
+
+    def delete_save_at_index(self, index):
+        """Remove the save at the given index."""
+        directory_frames, data_blocks = self._gather_save(index)
+        for frame in directory_frames:
+            # reset frame to unused state
+            memset(addressof(frame), 0, sizeof(frame))
+            DirectoryFrame.__init__(frame)
+
+        for data_block in data_blocks:
+            # zero out block
+            memset(addressof(data_block), 0, sizeof(data_block))
 
     def get_saves(self):
         """Extract all saves from the memory card."""
@@ -273,3 +329,42 @@ class MemoryCard(Structure):
             if entry.block_state == DirectoryFrame.BLOCK_FIRST:
                 slots[i] = self.get_save_at_index(i)
         return slots
+
+    def add_save(self, save):
+        # gather free blocks
+        free_block_indexes = []
+        for i, entry in enumerate(self.header.directory_frames):
+            if entry.block_state == DirectoryFrame.BLOCK_AVAILABLE:
+                free_block_indexes.append(i)
+        if len(free_block_indexes) < save.blocks:
+            log.error('Not enough free blocks')
+            return
+        # parse metadata from filename
+        country_code = save.filename[:2]
+        product_code = save.filename[2:2+10]
+        identifier = save.filename[2+10:]
+        for i in range(save.blocks):
+            free_block_index = free_block_indexes[i]
+            directory_frame = self.header.directory_frames[free_block_index]
+            directory_frame.country_code = country_code.encode('utf-8')
+            directory_frame.product_code = product_code.encode('utf-8')
+            directory_frame.identifier = identifier.encode('utf-8')
+            if i == 0:
+                directory_frame.save_length = 8192 * save.blocks
+                directory_frame.block_state = DirectoryFrame.BLOCK_FIRST
+            else:
+                directory_frame.save_length = 0
+                directory_frame.block_state = DirectoryFrame.BLOCK_MIDDLE
+                if i == save.blocks - 1:
+                    directory_frame.block_state = DirectoryFrame.BLOCK_LAST
+            if i != save.blocks - 1:
+                directory_frame.next_block = free_block_indexes[i + 1]
+                directory_frame.next_frame = 0
+            else:
+                directory_frame.next_block = 0xFF
+                directory_frame.next_frame = 0xFF
+            directory_frame.fix_xor()
+            data_block = self.data[free_block_index]
+            chunk = save.data[8192 * i:8192 * (i + 1)]
+            temp = DataBlock.from_buffer_copy(chunk)
+            memmove(addressof(data_block), addressof(temp), 8192)
